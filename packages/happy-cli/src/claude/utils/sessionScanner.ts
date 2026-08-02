@@ -30,9 +30,14 @@ export async function createSessionScanner(opts: {
     onMessage: (message: RawJSONLines) => void
     onTranscriptEvent?: (event: ScannerTranscriptEvent) => void
     /**
-     * How long a session transcript may stay absent before its watcher gives
-     * up and the session is dropped. Defaults to the startFileWatcher default
-     * (60s). Exposed mainly so tests can exercise the drop path quickly.
+     * How long the transcript's parent directory may stay continuously
+     * unwatchable before the watcher gives up and the session is dropped.
+     * Defaults to the startFileWatcher default (60s). Exposed mainly so tests
+     * can exercise the drop path quickly.
+     *
+     * Note this no longer bounds how long we wait for the transcript *file* —
+     * that wait is unbounded on purpose, because Claude Code creates it lazily
+     * on the first prompt. See startFileWatcher for the full rationale.
      */
     missingFileTimeoutMs?: number
 }) {
@@ -46,11 +51,17 @@ export async function createSessionScanner(opts: {
     let currentSessionId: string | null = null;
     let watchers = new Map<string, (() => void)>();
     let processedEntryKeys = new Set<string>();
-    // Sessions whose transcript file never appeared. Their watcher gave up,
-    // so we must stop re-reading them and never re-create a watcher for them
-    // — otherwise a phantom session id (e.g. a remote launch whose .jsonl is
-    // never written) keeps itself alive forever via the watchers map below
-    // and spins the CPU / floods the log (the "dead Happy instance" bug).
+    // Sessions whose watcher gave up because the project directory itself
+    // stayed unwatchable (missing, EACCES). Once dropped we must stop
+    // re-reading them and never re-create a watcher, or the id keeps itself
+    // alive forever via the watchers map below and floods the log (the
+    // "dead Happy instance" bug).
+    //
+    // A merely absent transcript no longer lands here: Claude Code creates it
+    // lazily on the first prompt, so the watcher waits for it indefinitely.
+    // That makes this set rare in practice — a phantom id now costs one idle
+    // directory watch for the lifetime of the process instead of being
+    // blacklisted after 60s. See startFileWatcher for why that trade is right.
     let deadSessions = new Set<string>();
 
     // Mark existing entries as processed and start watching the initial session
@@ -132,12 +143,14 @@ export async function createSessionScanner(opts: {
                     {
                         missingFileTimeoutMs: opts.missingFileTimeoutMs,
                         onGaveUp: () => {
-                            // The transcript for this session never appeared.
-                            // Tear the watcher down and blacklist the session
-                            // so the collection loop above stops resurrecting
-                            // it. Without this the phantom session would keep
-                            // itself in `watchers` forever.
-                            logger.debug(`[SESSION_SCANNER] Session ${p} transcript never appeared — dropping it`);
+                            // The project directory itself stayed unwatchable,
+                            // so we can never observe this transcript. Tear the
+                            // watcher down and blacklist the session so the
+                            // collection loop above stops resurrecting it.
+                            // Without this it would keep itself in `watchers`
+                            // forever. Note a merely late transcript does NOT
+                            // reach here — that wait is unbounded by design.
+                            logger.debug(`[SESSION_SCANNER] Session ${p} transcript unreachable (directory unwatchable) — dropping it`);
                             watchers.get(p)?.();
                             watchers.delete(p);
                             deadSessions.add(p);
@@ -157,12 +170,20 @@ export async function createSessionScanner(opts: {
     return {
         cleanup: async () => {
             clearInterval(intervalId);
+            // 顺序要紧：invalidateAndAwait 会真的再跑一遍 sync body，而 body 末尾
+            // 会为每个没有 watcher 的会话新建 watcher。若先释放再 clear()，这最后
+            // 一次同步会把它们全部重建，而随后的 sync.stop() 只置停止标志、不碰
+            // watchers，且 map 已清空、外部再无入口 —— 这些 persistent 的 OS watch
+            // 就永久无人释放。所以先冲刷并停掉 sync，再释放 watcher。
+            //
+            // 改动前这个泄漏是短暂的（旧 watcher 对不存在的文件 60s 后会自行
+            // onGaveUp 终止），现在 watcher 无限等待，泄漏会持续到进程退出。
+            await sync.invalidateAndAwait();
+            sync.stop();
             for (let w of watchers.values()) {
                 w();
             }
             watchers.clear();
-            await sync.invalidateAndAwait();
-            sync.stop();
         },
         onNewSession: async (sessionId: string, options?: { treatExistingAsProcessed?: boolean }) => {
             if (currentSessionId === sessionId) {
