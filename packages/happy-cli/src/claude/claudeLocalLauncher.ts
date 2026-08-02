@@ -4,6 +4,7 @@ import { Session } from "./session";
 import { Future } from "@/utils/future";
 import { createSessionScanner } from "./utils/sessionScanner";
 import { launchFailureMessage } from "./utils/launchFailureMessage";
+import { startClaudeStatusWatcher } from "./utils/claudeStatusWatcher";
 
 export type LauncherResult = { type: 'switch' } | { type: 'exit', code: number };
 
@@ -36,6 +37,12 @@ export async function claudeLocalLauncher(session: Session): Promise<LauncherRes
     };
     session.addSessionFoundCallback(scannerSessionCallback);
 
+    // 本地模式的 thinking 状态来源：Claude Code 自己维护的会话状态文件。
+    // 进程内 fetch 劫持对 2.x 的原生二进制无效，详见 claudeStatusWatcher.ts。
+    const stopStatusWatcher = startClaudeStatusWatcher({
+        getSessionId: () => session.sessionId,
+        onThinkingChange: session.onThinkingChange,
+    });
 
     // Handle abort
     let exitReason: LauncherResult | null = null;
@@ -173,6 +180,9 @@ export async function claudeLocalLauncher(session: Session): Promise<LauncherRes
         
         // Remove session found callback
         session.removeSessionFoundCallback(scannerSessionCallback);
+
+        // 停止状态监测（内部会把 thinking 归零，避免退出时卡在「工作中」）
+        stopStatusWatcher();
 
         // Cleanup
         await scanner.cleanup();

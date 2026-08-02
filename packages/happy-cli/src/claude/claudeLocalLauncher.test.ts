@@ -24,6 +24,13 @@ vi.mock('./utils/sessionScanner', () => ({
     createSessionScanner: mockCreateSessionScanner,
 }));
 
+// 不 mock 的话，这个 suite 会真去读开发者本机的 ~/.claude/sessions；
+// 且某条断言超时抛出时，launcher 的 finally 不会执行，
+// 500ms 的轮询 interval 会留在 vitest worker 里继续扫真实目录。
+vi.mock('./utils/claudeStatusWatcher', () => ({
+    startClaudeStatusWatcher: () => () => { },
+}));
+
 vi.mock('@/ui/logger', () => ({
     logger: {
         debug: vi.fn(),
