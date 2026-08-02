@@ -26,6 +26,21 @@ export class Session {
     sessionId: string | null;
     mode: 'local' | 'remote' = 'local';
     thinking: boolean = false;
+    /**
+     * 最近一次由 Claude Code 的 ai-title 推给 metadata.summary 的值。
+     *
+     * 只做一件事：跨 scanner 生命周期去重。ai-title 和 MCP change_title
+     * （以及手机端改名）写的是同一个 metadata.summary 字段，而 ai-title 没有
+     * 时间戳，无法按时间仲裁，也无法判断当前标题是谁写的。所以不去猜来源，
+     * 只保证「同一个 ai-title 不重复推送」：ai-title 真的变了才覆盖，
+     * 期间用户的改名就能保住。
+     *
+     * 必须挂在 Session 上而不是 launcher 局部变量 —— loop() 每次
+     * local↔remote 切换都会新建 scanner 并立即全量同步一次，局部状态会丢，
+     * 于是每次切回本地都把磁盘上那个没变过的 ai-title 重新推一遍，
+     * 静默覆盖用户刚改的名字。
+     */
+    lastAppliedAiTitle: string | null = null;
     
     /** Callbacks to be notified when session ID is found/changed */
     private sessionFoundCallbacks: ((sessionId: string) => void)[] = [];

@@ -16,7 +16,24 @@ export async function claudeLocalLauncher(session: Session): Promise<LauncherRes
     const scanner = await createSessionScanner({
         sessionId: session.sessionId,
         workingDirectory: session.path,
-        onMessage: (message) => { 
+        // Claude Code 自己生成的会话标题（transcript 里的 ai-title）。
+        // metadata.summary 就是手机端显示的标题，MCP change_title 最终也写这里。
+        //
+        // 用 session.lastAppliedAiTitle 跨 scanner 生命周期去重：loop() 每次
+        // local↔remote 切换都会新建 scanner 并立即全量同步一次，若不去重，
+        // 每次切回本地都会把磁盘上那个没变过的 ai-title 重新推一遍，
+        // 静默覆盖用户用 MCP change_title 或手机端刚改的名字。
+        onTitle: (title) => {
+            if (title === session.lastAppliedAiTitle) {
+                return;
+            }
+            session.lastAppliedAiTitle = title;
+            session.client.updateMetadata((metadata) => ({
+                ...metadata,
+                summary: { text: title, updatedAt: Date.now() },
+            }));
+        },
+        onMessage: (message) => {
             // Block SDK summary messages - we generate our own
             if (message.type !== 'summary') {
                 scannerMessageChain = scannerMessageChain.then(async () => {
