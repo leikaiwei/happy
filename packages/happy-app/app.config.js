@@ -208,6 +208,11 @@ export default {
             ]
         ],
         updates: {
+            // Local builds must keep their embedded JS bundle. The URL below
+            // points at upstream's EAS project and the channel is pinned to
+            // "production", so with updates enabled a locally built app would
+            // fetch upstream's bundle on launch and silently drop local patches.
+            enabled: false,
             url: "https://u.expo.dev/4558dd3d-cd5a-47cd-bad9-e591a241cc06",
             requestHeaders: {
                 "expo-channel-name": "production"
