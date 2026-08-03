@@ -8,7 +8,11 @@ const name = {
 }[variant];
 const bundleId = {
     development: "com.slopus.happy.dev",
-    preview: "com.slopus.happy.preview",
+    // Upstream's ids belong to their team, so a local build has to use its own.
+    // Deliberately a throwaway: signing with a free Apple Account registers the
+    // id to that Personal Team permanently, and it cannot be removed without
+    // asking Apple Developer Support. Keep a clean id in reserve.
+    preview: "com.leikaiwei.happy.trial",
     production: "com.ex3ndr.happy"
 }[variant];
 // const stagingElevenLabsAgentId = 'agent_7801k2c0r5hjfraa1kdbytpvs6yt';
