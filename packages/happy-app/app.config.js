@@ -134,6 +134,11 @@ export default {
             favicon: "./sources/assets/images/favicon.png"
         },
         plugins: [
+            // Registered first on purpose: Expo wraps entitlement mods like an
+            // onion, so the earliest-registered plugin runs last. Registered
+            // late, expo-notifications would re-add aps-environment after the
+            // strip and the build would still fail to sign on a free account.
+            require("./plugins/withoutPushEntitlement.js"),
             require("./plugins/withEinkCompatibility.js"),
             [
                 "expo-router",
@@ -205,7 +210,8 @@ export default {
                         }
                     }
                 }
-            ]
+            ],
+            require("./plugins/withoutPushEntitlement.js")
         ],
         updates: {
             // Local builds must keep their embedded JS bundle. The URL below
