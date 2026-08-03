@@ -401,4 +401,137 @@ describe('sessionScanner', () => {
       apiErrorStatus: 429,
     })
   })
+
+  // Claude Code 2.x writes its own generated session title as
+  // {"type":"ai-title","aiTitle":...}, which happy previously didn't
+  // recognize (it only knew the older type:"summary") — so the terminal's
+  // title changed while the phone's stayed stale.
+  describe('ai-title', () => {
+    const titleLine = (sessionId: string, aiTitle: string) =>
+      JSON.stringify({ type: 'ai-title', aiTitle, sessionId }) + '\n'
+
+    it('reports ai-title, and repeated writes of the same value do not re-report', async () => {
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000001'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+      const titles: string[] = []
+
+      // Observed in practice: the same title gets rewritten ~59 times per session on average
+      await writeFile(file, titleLine(sessionId, 'Initial title').repeat(5))
+
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+
+      expect(titles).toEqual(['Initial title'])
+    })
+
+    it('reports the new value when the title changes', async () => {
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000002'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+      const titles: string[] = []
+
+      await writeFile(file, titleLine(sessionId, 'Old title'))
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+      expect(titles).toEqual(['Old title'])
+
+      await appendFile(file, titleLine(sessionId, 'New title').repeat(3))
+      await new Promise((r) => setTimeout(r, 400))
+
+      expect(titles).toEqual(['Old title', 'New title'])
+    })
+
+    it('reports a revert back to a prior value', async () => {
+      // Dedup against a seen-set would swallow this revert, so dedup must
+      // compare against only the last-reported value.
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000003'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+      const titles: string[] = []
+
+      await writeFile(file, titleLine(sessionId, 'A'))
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+
+      await appendFile(file, titleLine(sessionId, 'B'))
+      await new Promise((r) => setTimeout(r, 400))
+      await appendFile(file, titleLine(sessionId, 'A'))
+      await new Promise((r) => setTimeout(r, 400))
+
+      expect(titles).toEqual(['A', 'B', 'A'])
+    })
+
+    it('only reports the current session title, not one dragged in from an old session file', async () => {
+      // Resume produces a new session id; the old file keeps its own
+      // ai-title. Reporting both would flip-flop between them every sync.
+      const oldId = 'aaaa1111-0000-4000-8000-000000000004'
+      const newId = 'aaaa1111-0000-4000-8000-000000000005'
+      const titles: string[] = []
+
+      await writeFile(join(projectDir, `${oldId}.jsonl`), titleLine(oldId, 'Old session title'))
+      await writeFile(join(projectDir, `${newId}.jsonl`), titleLine(newId, 'New session title'))
+
+      scanner = await createSessionScanner({
+        sessionId: oldId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+      expect(titles).toEqual(['Old session title'])
+
+      // After switching to the new session, the old file is still being
+      // scanned (Claude Code may keep writing to it), but the title should
+      // only ever come from the current session.
+      scanner.onNewSession(newId)
+      await new Promise((r) => setTimeout(r, 500))
+
+      expect(titles).toEqual(['Old session title', 'New session title'])
+    })
+
+    it('ignores a blank title', async () => {
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000006'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+      const titles: string[] = []
+
+      await writeFile(file, JSON.stringify({ type: 'ai-title', aiTitle: '   ', sessionId }) + '\n')
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+
+      expect(titles).toEqual([])
+    })
+
+    it('does not emit ai-title as a session message', async () => {
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000007'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+
+      await writeFile(file, titleLine(sessionId, 'Some title'))
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+
+      expect(collectedMessages).toHaveLength(0)
+    })
+  })
 })

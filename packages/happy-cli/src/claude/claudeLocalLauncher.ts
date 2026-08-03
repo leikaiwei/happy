@@ -17,7 +17,26 @@ export async function claudeLocalLauncher(session: Session): Promise<LauncherRes
     const scanner = await createSessionScanner({
         sessionId: session.sessionId,
         workingDirectory: session.path,
-        onMessage: (message) => { 
+        // Claude Code's own generated session title (ai-title in the transcript).
+        // metadata.summary is what the phone displays, and the change_title MCP
+        // tool ultimately writes the same field.
+        //
+        // Dedup against session.lastAppliedAiTitle across scanner lifetimes:
+        // loop() creates a fresh scanner and does one full sync on every
+        // local↔remote switch, and without this dedup every switch back to
+        // local would re-push the unchanged on-disk ai-title, silently
+        // overwriting a name the user just set via change_title or the phone.
+        onTitle: (title) => {
+            if (title === session.lastAppliedAiTitle) {
+                return;
+            }
+            session.lastAppliedAiTitle = title;
+            session.client.updateMetadata((metadata) => ({
+                ...metadata,
+                summary: { text: title, updatedAt: Date.now() },
+            }));
+        },
+        onMessage: (message) => {
             // Block SDK summary messages - we generate our own
             if (message.type !== 'summary') {
                 scannerMessageChain = scannerMessageChain.then(async () => {

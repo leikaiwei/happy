@@ -22,13 +22,35 @@ export type ScannerTranscriptEvent = ClaudeGoalStatusTranscriptEvent;
 
 type SessionLogEntry =
     | { kind: 'message'; key: string; message: RawJSONLines }
-    | { kind: 'transcript-event'; key: string; event: ScannerTranscriptEvent };
+    | { kind: 'transcript-event'; key: string; event: ScannerTranscriptEvent }
+    | { kind: 'title'; title: string };
+
+/**
+ * Claude Code 2.x writes its own generated session title into the transcript:
+ *   {"type":"ai-title","aiTitle":"...","sessionId":"..."}
+ * No uuid or timestamp, and the same title gets rewritten repeatedly, so it
+ * can't reuse the uuid-based dedup — callers must dedup by comparing against
+ * the last-reported value instead.
+ *
+ * Happy previously only recognized the older {"type":"summary"} message,
+ * which Claude Code 2.x no longer writes — that's why the phone's title
+ * stayed stale while the terminal's own title kept updating.
+ */
+function parseAiTitle(message: Record<string, unknown>): string | null {
+    if (message.type !== 'ai-title') {
+        return null;
+    }
+    const title = message.aiTitle;
+    return typeof title === 'string' && title.trim().length > 0 ? title.trim() : null;
+}
 
 export async function createSessionScanner(opts: {
     sessionId: string | null,
     workingDirectory: string
     onMessage: (message: RawJSONLines) => void
     onTranscriptEvent?: (event: ScannerTranscriptEvent) => void
+    /** Claude Code's own generated/updated session title (deduped by value, only fires on change) */
+    onTitle?: (title: string) => void
     /**
      * How long the transcript's parent directory may stay continuously
      * unwatchable before the watcher gives up and the session is dropped.
@@ -63,12 +85,22 @@ export async function createSessionScanner(opts: {
     // directory watch for the lifetime of the process instead of being
     // blacklisted after 60s. See startFileWatcher for why that trade is right.
     let deadSessions = new Set<string>();
+    // Last title reported to the caller. ai-title has no uuid and gets
+    // rewritten repeatedly, so dedup can only compare against this value —
+    // not a seen-set, which would swallow a legitimate A→B→A revert.
+    let lastReportedTitle: string | null = null;
 
     // Mark existing entries as processed and start watching the initial session
     if (opts.sessionId) {
         let entries = await readSessionEntries(projectDir, opts.sessionId);
         logger.debug(`[SESSION_SCANNER] Marking ${entries.length} existing entries as processed from session ${opts.sessionId}`);
         for (let entry of entries) {
+            // Titles don't participate in key-based dedup (no uuid), and must
+            // not be pre-marked away: on resume we specifically want to push
+            // whatever title is currently on disk.
+            if (entry.kind === 'title') {
+                continue;
+            }
             processedEntryKeys.add(entry.key);
         }
         // IMPORTANT: Also start watching the initial session file because Claude Code
@@ -104,7 +136,17 @@ export async function createSessionScanner(opts: {
             let skipped = 0;
             let sentMessages = 0;
             let sentTranscriptEvents = 0;
+            // Only the last ai-title line in the file is the current title;
+            // report it once after the loop instead of per-line, or a single
+            // sync would flash through every historical title in sequence.
+            let latestTitle: string | null = null;
             for (let entry of sessionEntries) {
+                // Titles don't go through processedEntryKeys — ai-title has
+                // no uuid, so value-based dedup is the only option.
+                if (entry.kind === 'title') {
+                    latestTitle = entry.title;
+                    continue;
+                }
                 if (processedEntryKeys.has(entry.key)) {
                     skipped++;
                     continue;
@@ -119,6 +161,14 @@ export async function createSessionScanner(opts: {
                     opts.onTranscriptEvent?.(entry.event);
                     sentTranscriptEvents++;
                 }
+            }
+            // Only report the current session's title — resume leaves the old
+            // session file behind with its own ai-title, and reporting both
+            // would flip-flop between old and new every sync.
+            if (latestTitle !== null && session === currentSessionId && latestTitle !== lastReportedTitle) {
+                lastReportedTitle = latestTitle;
+                logger.debug(`[SESSION_SCANNER] Session title changed: ${latestTitle}`);
+                opts.onTitle?.(latestTitle);
             }
             if (sessionEntries.length > 0) {
                 logger.debug(`[SESSION_SCANNER] Session ${session}: found=${sessionEntries.length}, skipped=${skipped}, sentMessages=${sentMessages}, sentTranscriptEvents=${sentTranscriptEvents}`);
@@ -199,13 +249,21 @@ export async function createSessionScanner(opts: {
             if (deadSessions.delete(sessionId)) {
                 logger.debug(`[SESSION_SCANNER] Reviving previously-dropped session: ${sessionId}`);
             }
-            if (finishedSessions.has(sessionId)) {
-                logger.debug(`[SESSION_SCANNER] New session: ${sessionId} is already finished, skipping`);
-                return;
-            }
-            if (pendingSessions.has(sessionId)) {
-                logger.debug(`[SESSION_SCANNER] New session: ${sessionId} is already pending, skipping`);
-                return;
+            // This id was previously current or queued. Returning here used
+            // to leave currentSessionId stuck on the old value — and since
+            // title reporting gates on that value, the current session's
+            // ai-title would be dropped forever (finishedSessions only ever
+            // grows, so any id that was once current stays poisoned).
+            // Trigger path: A → resume to B → Claude re-announces A (fork
+            // back via double-ESC, or --continue landing back on the
+            // original id). The caller is explicitly declaring "this one is
+            // active now", so re-adopt it as current. Messages aren't
+            // replayed by this — that dedup runs on the ever-growing
+            // processedEntryKeys (by uuid), unrelated to these two sets.
+            if (finishedSessions.has(sessionId) || pendingSessions.has(sessionId)) {
+                logger.debug(`[SESSION_SCANNER] Re-adopting previously tracked session as current: ${sessionId}`);
+                finishedSessions.delete(sessionId);
+                pendingSessions.delete(sessionId);
             }
             // When the caller already has these messages (typical for
             // happy-reconnect — the server holds the history from prior
@@ -218,6 +276,11 @@ export async function createSessionScanner(opts: {
                 const existing = await readSessionEntries(projectDir, sessionId);
                 logger.debug(`[SESSION_SCANNER] Pre-marking ${existing.length} existing entries as processed for new session ${sessionId}`);
                 for (const entry of existing) {
+                    // Same as above: titles have no key, and even after
+                    // reconnect the current title still needs to reach the phone.
+                    if (entry.kind === 'title') {
+                        continue;
+                    }
                     processedEntryKeys.add(entry.key);
                 }
             }
@@ -283,6 +346,12 @@ async function readSessionEntries(projectDir: string, sessionId: string): Promis
             // Silently skip known internal Claude Code events
             // These are state/tracking events, not conversation messages
             if (message.type && INTERNAL_CLAUDE_EVENT_TYPES.has(message.type)) {
+                continue;
+            }
+
+            const aiTitle = parseAiTitle(message);
+            if (aiTitle) {
+                entries.push({ kind: 'title', title: aiTitle });
                 continue;
             }
 

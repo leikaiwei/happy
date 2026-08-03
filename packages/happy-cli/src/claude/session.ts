@@ -33,7 +33,24 @@ export class Session {
     sessionId: string | null;
     mode: 'local' | 'remote' = 'local';
     thinking: boolean = false;
-    
+    /**
+     * Last ai-title value pushed to metadata.summary by Claude Code's own
+     * generated title. Purpose: dedup across scanner lifetimes. ai-title and
+     * the change_title MCP tool (and phone renames) write the same
+     * metadata.summary field, and ai-title has no timestamp, so we can't
+     * arbitrate by time or tell who wrote the current title. Rather than
+     * guess the source, we only guarantee "the same ai-title isn't pushed
+     * twice" — genuinely new ai-title values still overwrite, but a user's
+     * rename in between survives.
+     *
+     * Must live on Session, not a launcher-local variable — loop() creates a
+     * fresh scanner and does one full sync on every local↔remote switch, so a
+     * local variable would lose its state and re-push the unchanged on-disk
+     * ai-title every time local mode resumes, silently overwriting a name the
+     * user just set via change_title or the phone.
+     */
+    lastAppliedAiTitle: string | null = null;
+
     /** Callbacks to be notified when session ID is found/changed */
     private sessionFoundCallbacks: ((sessionId: string) => void)[] = [];
     
