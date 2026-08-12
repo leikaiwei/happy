@@ -22,13 +22,33 @@ export type ScannerTranscriptEvent = ClaudeGoalStatusTranscriptEvent;
 
 type SessionLogEntry =
     | { kind: 'message'; key: string; message: RawJSONLines }
-    | { kind: 'transcript-event'; key: string; event: ScannerTranscriptEvent };
+    | { kind: 'transcript-event'; key: string; event: ScannerTranscriptEvent }
+    | { kind: 'title'; title: string };
+
+/**
+ * Claude Code 2.x 把它自己生成的会话标题写进 transcript：
+ *   {"type":"ai-title","aiTitle":"...","sessionId":"..."}
+ * 没有 uuid / timestamp，且同一标题会被反复写入（实测平均每个会话 ~59 次），
+ * 所以不能套用基于 uuid 的去重，只能按「与上次已上报的标题是否相同」判断。
+ *
+ * 早期版本写的是 {"type":"summary"}，happy 至今只认那个 —— 这就是手机端
+ * 标题停留在旧值的原因（最近的 transcript 里 summary 行数为 0）。
+ */
+function parseAiTitle(message: Record<string, unknown>): string | null {
+    if (message.type !== 'ai-title') {
+        return null;
+    }
+    const title = message.aiTitle;
+    return typeof title === 'string' && title.trim().length > 0 ? title.trim() : null;
+}
 
 export async function createSessionScanner(opts: {
     sessionId: string | null,
     workingDirectory: string
     onMessage: (message: RawJSONLines) => void
     onTranscriptEvent?: (event: ScannerTranscriptEvent) => void
+    /** Claude Code 自己生成/更新了会话标题时回调（已按值去重，只在变化时触发） */
+    onTitle?: (title: string) => void
     /**
      * How long the transcript's parent directory may stay continuously
      * unwatchable before the watcher gives up and the session is dropped.
@@ -63,12 +83,19 @@ export async function createSessionScanner(opts: {
     // directory watch for the lifetime of the process instead of being
     // blacklisted after 60s. See startFileWatcher for why that trade is right.
     let deadSessions = new Set<string>();
+    // 上次已上报的会话标题。ai-title 无 uuid 且会重复写入，只能按值去重。
+    let lastReportedTitle: string | null = null;
 
     // Mark existing entries as processed and start watching the initial session
     if (opts.sessionId) {
         let entries = await readSessionEntries(projectDir, opts.sessionId);
         logger.debug(`[SESSION_SCANNER] Marking ${entries.length} existing entries as processed from session ${opts.sessionId}`);
         for (let entry of entries) {
+            // 标题不参与 key 去重（无 uuid），也不该被预标记吞掉：
+            // resume 时正需要把磁盘上的当前标题推给手机端。
+            if (entry.kind === 'title') {
+                continue;
+            }
             processedEntryKeys.add(entry.key);
         }
         // IMPORTANT: Also start watching the initial session file because Claude Code
@@ -104,7 +131,15 @@ export async function createSessionScanner(opts: {
             let skipped = 0;
             let sentMessages = 0;
             let sentTranscriptEvents = 0;
+            // 文件里最后一条 ai-title 才是当前标题，循环结束后统一上报，
+            // 避免一次同步里把历史标题依次推上去造成闪烁。
+            let latestTitle: string | null = null;
             for (let entry of sessionEntries) {
+                // 标题不走 processedEntryKeys：ai-title 没有 uuid，只能按值去重
+                if (entry.kind === 'title') {
+                    latestTitle = entry.title;
+                    continue;
+                }
                 if (processedEntryKeys.has(entry.key)) {
                     skipped++;
                     continue;
@@ -119,6 +154,13 @@ export async function createSessionScanner(opts: {
                     opts.onTranscriptEvent?.(entry.event);
                     sentTranscriptEvents++;
                 }
+            }
+            // 只上报当前会话的标题 —— resume 会留下旧会话文件，它们各自带着
+            // 自己的 ai-title，若一并上报会每轮在新旧标题间来回翻。
+            if (latestTitle !== null && session === currentSessionId && latestTitle !== lastReportedTitle) {
+                lastReportedTitle = latestTitle;
+                logger.debug(`[SESSION_SCANNER] Session title changed: ${latestTitle}`);
+                opts.onTitle?.(latestTitle);
             }
             if (sessionEntries.length > 0) {
                 logger.debug(`[SESSION_SCANNER] Session ${session}: found=${sessionEntries.length}, skipped=${skipped}, sentMessages=${sentMessages}, sentTranscriptEvents=${sentTranscriptEvents}`);
@@ -199,13 +241,18 @@ export async function createSessionScanner(opts: {
             if (deadSessions.delete(sessionId)) {
                 logger.debug(`[SESSION_SCANNER] Reviving previously-dropped session: ${sessionId}`);
             }
-            if (finishedSessions.has(sessionId)) {
-                logger.debug(`[SESSION_SCANNER] New session: ${sessionId} is already finished, skipping`);
-                return;
-            }
-            if (pendingSessions.has(sessionId)) {
-                logger.debug(`[SESSION_SCANNER] New session: ${sessionId} is already pending, skipping`);
-                return;
+            // 这个 id 之前当过 current 或排过队。以前遇到这种情况直接 return，
+            // 于是 currentSessionId 停在旧值 —— 而标题上报以它为唯一闸门，
+            // 当前会话的 ai-title 会被永久丢弃（finishedSessions 只增不减，
+            // 任何当过 current 的 id 都被永久毒化）。触发路径：A → resume 到 B
+            // → claude 再次宣告 A（双 ESC fork 回去、--continue 落回原 id）。
+            // 调用方在明确宣告「现在活跃的是它」，所以照常认领为 current。
+            // 消息不会因此重放：去重靠只增的 processedEntryKeys（按 uuid），
+            // 与这两个集合无关。
+            if (finishedSessions.has(sessionId) || pendingSessions.has(sessionId)) {
+                logger.debug(`[SESSION_SCANNER] Re-adopting previously tracked session as current: ${sessionId}`);
+                finishedSessions.delete(sessionId);
+                pendingSessions.delete(sessionId);
             }
             // When the caller already has these messages (typical for
             // happy-reconnect — the server holds the history from prior
@@ -218,6 +265,10 @@ export async function createSessionScanner(opts: {
                 const existing = await readSessionEntries(projectDir, sessionId);
                 logger.debug(`[SESSION_SCANNER] Pre-marking ${existing.length} existing entries as processed for new session ${sessionId}`);
                 for (const entry of existing) {
+                    // 同上：标题无 key，且重连后仍需把当前标题同步给手机端
+                    if (entry.kind === 'title') {
+                        continue;
+                    }
                     processedEntryKeys.add(entry.key);
                 }
             }
@@ -283,6 +334,12 @@ async function readSessionEntries(projectDir: string, sessionId: string): Promis
             // Silently skip known internal Claude Code events
             // These are state/tracking events, not conversation messages
             if (message.type && INTERNAL_CLAUDE_EVENT_TYPES.has(message.type)) {
+                continue;
+            }
+
+            const aiTitle = parseAiTitle(message);
+            if (aiTitle) {
+                entries.push({ kind: 'title', title: aiTitle });
                 continue;
             }
 

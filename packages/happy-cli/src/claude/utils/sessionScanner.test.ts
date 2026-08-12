@@ -401,4 +401,134 @@ describe('sessionScanner', () => {
       apiErrorStatus: 429,
     })
   })
+
+  // Bug C 回归：Claude Code 2.x 把它自己生成的会话标题写成
+  // {"type":"ai-title","aiTitle":...}，happy 原先只认早期的 type:"summary"，
+  // 于是电脑端标题变了、手机端还停在旧值。
+  describe('ai-title', () => {
+    const titleLine = (sessionId: string, aiTitle: string) =>
+      JSON.stringify({ type: 'ai-title', aiTitle, sessionId }) + '\n'
+
+    it('上报 ai-title，且重复写入不重复上报', async () => {
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000001'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+      const titles: string[] = []
+
+      // 实测同一标题平均会被重复写入约 59 次，必须吸收掉
+      await writeFile(file, titleLine(sessionId, '初始标题').repeat(5))
+
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+
+      expect(titles).toEqual(['初始标题'])
+    })
+
+    it('标题变化时上报新值', async () => {
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000002'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+      const titles: string[] = []
+
+      await writeFile(file, titleLine(sessionId, '旧标题'))
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+      expect(titles).toEqual(['旧标题'])
+
+      await appendFile(file, titleLine(sessionId, '新标题').repeat(3))
+      await new Promise((r) => setTimeout(r, 400))
+
+      expect(titles).toEqual(['旧标题', '新标题'])
+    })
+
+    it('标题回退到旧值也能上报', async () => {
+      // 按「已见过的值集合」去重会漏掉这种回退，所以只比对上次上报的值
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000003'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+      const titles: string[] = []
+
+      await writeFile(file, titleLine(sessionId, 'A'))
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+
+      await appendFile(file, titleLine(sessionId, 'B'))
+      await new Promise((r) => setTimeout(r, 400))
+      await appendFile(file, titleLine(sessionId, 'A'))
+      await new Promise((r) => setTimeout(r, 400))
+
+      expect(titles).toEqual(['A', 'B', 'A'])
+    })
+
+    it('只上报当前会话的标题，不被旧会话文件带偏', async () => {
+      // resume 会产生新的 session id，旧文件仍带着自己的 ai-title。
+      // 若两个文件的标题都上报，每轮同步都会在两者间来回翻。
+      const oldId = 'aaaa1111-0000-4000-8000-000000000004'
+      const newId = 'aaaa1111-0000-4000-8000-000000000005'
+      const titles: string[] = []
+
+      await writeFile(join(projectDir, `${oldId}.jsonl`), titleLine(oldId, '旧会话标题'))
+      await writeFile(join(projectDir, `${newId}.jsonl`), titleLine(newId, '新会话标题'))
+
+      scanner = await createSessionScanner({
+        sessionId: oldId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+      expect(titles).toEqual(['旧会话标题'])
+
+      // 切到新会话后，旧文件仍在被扫描（Claude Code 可能继续写），
+      // 但标题只应来自当前会话
+      scanner.onNewSession(newId)
+      await new Promise((r) => setTimeout(r, 500))
+
+      expect(titles).toEqual(['旧会话标题', '新会话标题'])
+    })
+
+    it('忽略空标题', async () => {
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000006'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+      const titles: string[] = []
+
+      await writeFile(file, JSON.stringify({ type: 'ai-title', aiTitle: '   ', sessionId }) + '\n')
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTitle: (t) => titles.push(t),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+
+      expect(titles).toEqual([])
+    })
+
+    it('ai-title 不会被当成会话消息发出去', async () => {
+      const sessionId = 'aaaa1111-0000-4000-8000-000000000007'
+      const file = join(projectDir, `${sessionId}.jsonl`)
+
+      await writeFile(file, titleLine(sessionId, '某标题'))
+      scanner = await createSessionScanner({
+        sessionId,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+      })
+      await new Promise((r) => setTimeout(r, 200))
+
+      expect(collectedMessages).toHaveLength(0)
+    })
+  })
 })
