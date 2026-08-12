@@ -1,7 +1,8 @@
 const fs = require('fs');
 
-// Disable autoupdater (never works really)
-process.env.DISABLE_AUTOUPDATER = '1';
+// Local-only deviation from upstream: the autoupdater is left enabled. Upstream
+// sets DISABLE_AUTOUPDATER=1 here, which pins Claude Code to whatever version
+// was installed first, since every session goes through this launcher.
 
 // Helper to write JSON messages to fd 3
 function writeMessage(message) {
